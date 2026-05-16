@@ -148,22 +148,29 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ## 6. Real numbers measured on this rig
 
-Numbers from `llama-bench` on Qwen3-class 30B-A3B MoE Q4 (representative of the 35B-A3B at same active-param count):
+Measured with `llama-bench` on `build: 64b38b5`:
+
+**Qwen3.6-35B-A3B UD-Q4_K_XL** (daily driver):
 
 ```
-Prefill (pp512) : 247 tok/s
-Generate (tg128):  25 tok/s
-Load time       : ~4 sec
+pp512    : 157.85 tok/s
+pp1024   : 156.39 tok/s       (flat — prefill is compute-bound, not attention-bound at this length)
+pp2048   : 140.68 tok/s       (attention quadratic cost starts to bite)
+tg128    :  16.83 tok/s
 ```
 
-For the dense 27B-MTP UD-Q4_K_XL with MTP speculative decoding (`--spec-type draft-mtp --spec-draft-n-max 12`, thinking disabled):
+**Qwen3.6-27B-MTP UD-Q4_K_XL** with MTP speculative decoding (`--spec-type draft-mtp --spec-draft-n-max 12`, thinking disabled in client requests):
 
 ```
-Prefill (pp512) : 60 tok/s
-Generate        :  7 tok/s   (vs 3.3 tok/s without MTP — exactly 2.1× speedup)
+pp512    :  60 tok/s
+tg (gen) :   7 tok/s          (vs 3.3 tok/s without MTP — exactly 2.1× speedup)
 ```
 
-These match the theoretical ceiling for the architecture. The 247 tok/s prefill is consistent with upstream's projection for 8 CUs of gfx1151-class silicon (Strix Halo at 40 CUs hits ~1256 tok/s on the same model — five times our CU count, five times the throughput).
+### A note on quants
+
+UD-Q4_K_XL is Unsloth's dynamic quant — uses Q5/Q6 on critical tensors (attention/embeddings), Q4 elsewhere. The file is ~23% larger than vanilla Q4_K_M, which translates to ~23% more bandwidth per token. If you want to trade some quality for speed, swap in the regular Q4_K_M (~17 GB vs ~21 GB), expect roughly +25% throughput.
+
+These match the theoretical bandwidth ceiling for 8 CUs of gfx1151-class silicon. For reference, Strix Halo at 40 CUs hits ~1256 tok/s prefill on the same model class — exactly 5× our throughput, exactly 5× the CU count. The math is honest.
 
 ## 7. Quick mental model: why MoE wins on this hardware
 
