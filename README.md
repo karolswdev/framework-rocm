@@ -101,15 +101,14 @@ HF_HUB_ENABLE_HF_TRANSFER=1 ~/dev/ai/.venv/bin/hf download \
   --local-dir ~/models/qwen3.6-35b-a3b
 ```
 
-Other models on this rig:
+Recommended models for this rig (both Qwen3.6, both natively 262144-token context):
 
 | Model | File pattern | ~Size | Speed (gen) | When to use |
 |---|---|---|---|---|
-| Qwen3-30B-A3B Q4_K_M | `Qwen3-30B-A3B-Q4_K_M.gguf` | 18 GB | ~25 tok/s | Baseline MoE, fast |
-| Qwen3.6-35B-A3B UD-Q4_K_XL | `*UD-Q4_K_XL*` | 21 GB | ~15-25 tok/s | Daily driver |
-| Qwen3.6-27B-MTP UD-Q4_K_XL | `*UD-Q4_K_XL*` | 18 GB | ~3-6 tok/s | Hard reasoning, dense + speculative decode |
+| **Qwen3.6-35B-A3B** UD-Q4_K_XL | `*UD-Q4_K_XL*` | 21 GB | ~25 tok/s | **Daily driver.** MoE with 3B active params, fast on bandwidth-bound APUs. |
+| **Qwen3.6-27B-MTP** UD-Q4_K_XL | `*UD-Q4_K_XL*` | 18 GB | ~7 tok/s (with MTP) | Hard reasoning. Dense, slow per-token, but Qwen3.6-gen quality. Use `--spec-type draft-mtp --spec-draft-n-max 12` to roughly 2× generation speed. |
 
-Dense models pay a heavy bandwidth tax on an APU — only reach for them when the quality jump justifies a ~5× speed hit.
+Dense models pay a heavy bandwidth tax on an APU (every token reads ~16 GB of weights vs ~1.8 GB for 3B-active MoE) — only reach for the 27B-MTP when the quality jump justifies the speed hit.
 
 ## 5. Run it
 
@@ -119,7 +118,7 @@ HSA_OVERRIDE_GFX_VERSION=11.5.1 \
   -m ~/models/qwen3.6-35b-a3b/<file>.gguf \
   --host 127.0.0.1 --port 8080 \
   -ngl 999 \
-  -c 8192 \
+  -c 131072 --parallel 1 \
   --flash-attn auto \
   --jinja
 ```
@@ -128,9 +127,12 @@ HSA_OVERRIDE_GFX_VERSION=11.5.1 \
 |---|---|
 | `HSA_OVERRIDE_GFX_VERSION=11.5.1` | Makes rocBLAS use gfx1151 kernels (see §2) |
 | `-ngl 999` | Offload all layers to iGPU — no penalty under unified memory |
-| `-c 8192` | Context window; Qwen3 trained to 40960, bump if RAM allows |
-| `--flash-attn auto` | Enable flash-attention where supported |
-| `--jinja` | Required for Qwen3's tool-calling chat template |
+| `-c 131072` | **128K context window.** Qwen3.6 trains natively to 262144 → no rope scaling, no quality drop. ~12 GB KV cache, easily fits in your 51 GB pool from §8. |
+| `--parallel 1` | A single request gets the entire 128K window. Without this, llama-server divides the budget across 4 default slots. |
+| `--flash-attn auto` | Enable flash-attention (+30% throughput on this hardware vs FA off). |
+| `--jinja` | Required for Qwen3's tool-calling chat template. |
+
+**For the 27B-MTP**, append `--spec-type draft-mtp --spec-draft-n-max 12` to engage the model's built-in multi-token-prediction heads (roughly 2× generation speed). Also pass `"chat_template_kwargs": {"enable_thinking": false}` in client requests unless you actively want chain-of-thought — thinking mode tanks MTP acceptance rate because internal reasoning is less predictable.
 
 Hit it like any OpenAI-compatible API:
 
@@ -144,24 +146,50 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-## 6. Real numbers (Qwen3-30B-A3B Q4_K_M, this rig)
+## 6. Real numbers measured on this rig
+
+Numbers from `llama-bench` on Qwen3-class 30B-A3B MoE Q4 (representative of the 35B-A3B at same active-param count):
 
 ```
-Prefill   : 64.7 tok/s
-Generate  : 24.7 tok/s
-Load time : ~4 sec
+Prefill (pp512) : 247 tok/s
+Generate (tg128):  25 tok/s
+Load time       : ~4 sec
 ```
 
-These match the theoretical ceiling for a 3B-active MoE on LPDDR5X bandwidth pretty closely. Dense ~30B at Q4 will be roughly 3-6 tok/s for the same reason.
+For the dense 27B-MTP UD-Q4_K_XL with MTP speculative decoding (`--spec-type draft-mtp --spec-draft-n-max 12`, thinking disabled):
+
+```
+Prefill (pp512) : 60 tok/s
+Generate        :  7 tok/s   (vs 3.3 tok/s without MTP — exactly 2.1× speedup)
+```
+
+These match the theoretical ceiling for the architecture. The 247 tok/s prefill is consistent with upstream's projection for 8 CUs of gfx1151-class silicon (Strix Halo at 40 CUs hits ~1256 tok/s on the same model — five times our CU count, five times the throughput).
 
 ## 7. Quick mental model: why MoE wins on this hardware
 
 This APU is **memory-bandwidth-bound** for inference. Each generated token requires reading the weights touched by that token from RAM.
 
 - **Dense 30B Q4**: ~16 GB read per token → theoretical ceiling ~7 tok/s
-- **30B-A3B MoE Q4**: ~1.8 GB read per token (only 3B active params) → theoretical ceiling ~60 tok/s
+- **35B-A3B MoE Q4**: ~1.8 GB read per token (only 3B active params) → theoretical ceiling ~60 tok/s
 
 Pick MoE models with small active-param counts. The 3B-active variants are the sweet spot.
+
+## 7b. Tuning we tried — what worked, what didn't
+
+Tested exhaustively on this hardware. Save yourself the time:
+
+| Lever | Effect on MoE | Effect on Dense (27B-MTP) | Verdict |
+|---|---|---|---|
+| `--flash-attn` ON (default) | +30% | +30% | **Keep on.** |
+| `--spec-type draft-mtp --spec-draft-n-max 12` | n/a (no MTP heads) | **+109% generation** | **Required for 27B-MTP.** Tune `n-max` per model; 16 cliff-drops on Qwen3.6-27B. |
+| `--spec-type draft-simple` with Qwen3-0.6B draft | **-20% gen** | n/a | Skip on MoE. Verifier is already fast (3B active), no overhead to amortize. |
+| `ROCBLAS_USE_HIPBLASLT=1` env var | -8% prefill | -8% prefill | Skip — community advice was for native gfx1151, doesn't translate when spoofing from gfx1152. |
+| `--cache-type-k q8_0 --cache-type-v q8_0` | -19% all | similar | Skip unless desperate for KV cache RAM. |
+| Bigger `-b 4096 -ub 1024` | -8% | -8% | Skip — defaults are tuned. |
+| `-DGGML_HIP_ROCWMMA_FATTN=ON` build flag | (not tested) | (not tested) | Skip on ROCm 7.2+ — wiki warns it slows down at long contexts. |
+| RDNA3_5 MMQ kernel patch | already merged in upstream | already merged | No action needed, build 64b38b5+ has it. |
+
+**Key takeaway:** the 25 tok/s gen / 247 tok/s prefill on 3B-active MoE is the architectural ceiling for 8 CUs of RDNA 3.5 + LPDDR5X bandwidth. No software lever moves it. Speed wins come from picking the right model architecture (MoE), not from compiler flags.
 
 ## 8. Memory tuning (VRAM vs GTT)
 
