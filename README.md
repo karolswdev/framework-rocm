@@ -163,6 +163,63 @@ This APU is **memory-bandwidth-bound** for inference. Each generated token requi
 
 Pick MoE models with small active-param counts. The 3B-active variants are the sweet spot.
 
+## 8. Memory tuning (VRAM vs GTT)
+
+The "32 GB VRAM" you see in `llama-server`'s startup banner is misleading. Run `rocm-smi --showmeminfo vram gtt` and you'll find:
+
+```
+VRAM Total: 536 MB       ← actual BIOS-reserved UMA frame buffer
+GTT Total:  32.8 GB      ← shared system RAM the iGPU can borrow
+GTT Used:   19.75 GB     ← model weights + KV cache live here
+```
+
+**Two pools, same DDR5, same bandwidth.** On a discrete GPU, the VRAM/GTT distinction matters because VRAM has ~10× the bandwidth of system RAM over PCIe. On an APU, both live in the same DDR5 sticks, so the only practical difference is:
+
+- **VRAM (UMA frame buffer)**: reserved by BIOS, OS can never reclaim it.
+- **GTT**: shared with the OS, kernel can reclaim under pressure, soft-capped by `amdgpu.gttsize` / `ttm.pages_limit`.
+
+### Two ways to give the iGPU more headroom
+
+**Option A — BIOS UMA frame buffer.** On the Framework BIOS, under *AMD CBS → NBIO → GFX Configuration → UMA Frame Buffer Size*, you can set a fixed allocation (typical options: AUTO, 512 MB, 2 GB, 4 GB, 8 GB, 16 GB, sometimes higher on Krackan/Strix).
+
+- **Pro**: guaranteed reservation, won't compete with OS pressure, ROCm prefers it for some allocations.
+- **Con**: that RAM is gone for the OS even when you're not running LLMs.
+
+**Option B — kernel parameter (recommended for this use case).** Raise the GTT cap, leaving BIOS on AUTO:
+
+```bash
+# /etc/default/grub
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amdgpu.gttsize=49152 ttm.pages_limit=14155776"
+```
+
+Then `sudo update-grub` and reboot. `gttsize` is in MB; `ttm.pages_limit` is in 4 KB pages (49152 MB / 4 KB ≈ 12.6M pages, set with a bit of headroom). On kernel 6.x, **both** flags are needed — the TTM subsystem caps allocations independently of the amdgpu driver.
+
+- **Pro**: flexible, OS gets RAM back when the iGPU isn't using it, no BIOS visit needed.
+- **Con**: shared with the OS, theoretical pressure under heavy multitasking.
+
+### What you gain by raising the iGPU ceiling to ~48 GB
+
+| Today (32 GB iGPU pool) | At 48 GB iGPU pool |
+|---|---|
+| Qwen3.6-35B-A3B Q4 + 8K context | Same model + **64K context** |
+| Q4_K_M only | **Q6_K** of 35B-A3B (~28 GB) — meaningfully better quality |
+| Single model | Main model + **draft model for speculative decoding** |
+| Can't fit ~70B Q4 | Fits 70B dense Q4 (slow on dense, but possible) |
+
+For agentic workloads the **context window** is usually the biggest practical win — agent loops accumulate tool-call history fast, and 64K+ keeps the conversation alive without compaction.
+
+### Verifying after reboot
+
+```bash
+rocm-smi --showmeminfo vram gtt
+# expect: GTT Total ≈ 49 GB
+
+# also visible in llama-server startup banner:
+# ROCm0 : AMD Radeon Graphics (XXXXX MiB, YYYYY MiB free)
+```
+
+If `GTT Total` didn't move, check `cat /proc/cmdline` actually shows your new params — GRUB sometimes silently keeps the previous cmdline if `update-grub` errored.
+
 ## Future explorations
 
 - **Vision (mmproj)**: Qwen3.6 is natively multimodal. Download `mmproj-*.gguf` alongside the model and pass `--mmproj` to `llama-server` for image input.
